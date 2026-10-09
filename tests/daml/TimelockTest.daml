@@ -1,0 +1,194 @@
+-- | Daml Script tests. Daml Script runs against an in-memory ledger and lets us
+-- act as different parties (`submit alice ...`) and control the ledger clock
+-- (`setTime`, `passTime`). `submitMustFail` passes only if the command is
+-- rejected, which is how we test attack paths.
+module TimelockTest where
+
+import Daml.Script
+import DA.Foldable (forA_)
+import DA.Date (date, Month(..))
+import DA.Time (time, addRelTime, days, seconds)
+import Timelock
+
+-- | Everything a test needs: parties and a freshly created Timelock (min delay 2 days).
+data Setup = Setup with
+  admin : Party
+  executor : Party
+  guardian : Party
+  guardian2 : Party
+  watcher : Party
+  outsider : Party   -- unrelated party: must never see anything
+  timelockCid : ContractId Timelock
+
+t0 : Time
+t0 = time (date 2026 Jan 1) 0 0 0
+
+setup : Script Setup
+setup = do
+  admin <- allocateParty "admin"
+  executor <- allocateParty "executor"
+  guardian <- allocateParty "guardian"
+  guardian2 <- allocateParty "guardian2"
+  watcher <- allocateParty "watcher"
+  outsider <- allocateParty "outsider"
+  setTime t0
+  timelockCid <- submit admin do
+    createCmd Timelock with
+      admin; executor; guardians = [guardian, guardian2]
+      watchers = [watcher]; minDelay = days 2
+  pure Setup with ..
+
+-- Convenience: schedule `action` at now + 3 days (comfortably after minDelay).
+scheduleOk : Setup -> TimelockedAction -> Script (ContractId PendingAction)
+scheduleOk s action = submit s.admin do
+  exerciseCmd s.timelockCid Schedule with action; eta = addRelTime t0 (days 3)
+
+-- ---------------------------------------------------------------- happy path
+
+-- PROVES: schedule -> wait past eta -> execute works, and leaves a receipt.
+testScheduleAndExecute : Script ()
+testScheduleAndExecute = do
+  s <- setup
+  pending <- scheduleOk s (UpdateParameter { name = "feeBps", value = 30 })
+  passTime (days 3 + seconds 1)
+  receiptCid <- submit s.executor do exerciseCmd pending Execute
+  Some receipt <- queryContractId s.executor receiptCid
+  assertMsg "receipt records the action" (receipt.action == UpdateParameter { name = "feeBps", value = 30 })
+  -- the pending action is gone
+  gone <- queryContractId s.executor pending
+  assertMsg "pending action must be archived" (gone == None)
+
+-- PROVES: a guardian can cancel; afterwards nobody can execute it.
+testGuardianCancels : Script ()
+testGuardianCancels = do
+  s <- setup
+  pending <- scheduleOk s (TransferTreasury { recipient = s.watcher, amount = 100.0 })
+  submit s.guardian2 do exerciseCmd pending Cancel with canceller = s.guardian2
+  passTime (days 4)
+  submitMustFail s.executor do exerciseCmd pending Execute
+
+-- PROVES: an UpdateDelay that goes through the full delay path really changes minDelay.
+testUpdateDelayViaTimelock : Script ()
+testUpdateDelayViaTimelock = do
+  s <- setup
+  pending <- scheduleOk s (UpdateDelay (days 5))
+  passTime (days 3 + seconds 1)
+  submit s.executor do exerciseCmd pending Execute
+  [(_, tl)] <- query @Timelock s.admin
+  assertMsg "minDelay is now 5 days" (tl.minDelay == days 5)
+
+-- ------------------------------------------------------------- attack paths
+
+-- PROVES: execution before eta is rejected.
+testExecuteTooEarly : Script ()
+testExecuteTooEarly = do
+  s <- setup
+  pending <- scheduleOk s (UpdateParameter { name = "x", value = 1 })
+  passTime (days 2)  -- eta is at +3 days
+  submitMustFail s.executor do exerciseCmd pending Execute
+
+-- PROVES: scheduling with eta < now + minDelay is rejected (but exactly at the boundary is fine).
+testScheduleBelowMinDelay : Script ()
+testScheduleBelowMinDelay = do
+  s <- setup
+  let action = UpdateParameter { name = "x", value = 1 }
+  submitMustFail s.admin do
+    exerciseCmd s.timelockCid Schedule with
+      action; eta = addRelTime t0 (seconds (2 * 86400 - 1))
+  submit s.admin do
+    exerciseCmd s.timelockCid Schedule with action; eta = addRelTime t0 (days 2)
+  pure ()
+
+
+-- PROVES: only the executor can execute (admin, guardian, watcher, outsider cannot).
+testNonExecutorCannotExecute : Script ()
+testNonExecutorCannotExecute = do
+  s <- setup
+  pending <- scheduleOk s (UpdateParameter { name = "x", value = 1 })
+  passTime (days 4)
+  submitMustFail s.admin do exerciseCmd pending Execute
+  submitMustFail s.guardian do exerciseCmd pending Execute
+  submitMustFail s.watcher do exerciseCmd pending Execute
+  submitMustFail s.outsider do exerciseCmd pending Execute
+
+-- PROVES: only guardians can cancel, even though the watcher can see the action
+-- and even if they claim to be a guardian in the argument.
+testNonGuardianCannotCancel : Script ()
+testNonGuardianCannotCancel = do
+  s <- setup
+  pending <- scheduleOk s (UpdateParameter { name = "x", value = 1 })
+  submitMustFail s.watcher do exerciseCmd pending Cancel with canceller = s.watcher
+  submitMustFail s.executor do exerciseCmd pending Cancel with canceller = s.executor
+  submitMustFail s.admin do exerciseCmd pending Cancel with canceller = s.admin
+  submitMustFail s.outsider do exerciseCmd pending Cancel with canceller = s.outsider
+  -- impersonation: outsider submits but names a guardian as canceller -> lacks that authority
+  submitMustFail s.outsider do exerciseCmd pending Cancel with canceller = s.guardian
+
+-- PROVES: an action cannot be executed twice (Execute consumes the contract).
+testDoubleExecute : Script ()
+testDoubleExecute = do
+  s <- setup
+  pending <- scheduleOk s (UpdateParameter { name = "x", value = 1 })
+  passTime (days 4)
+  submit s.executor do exerciseCmd pending Execute
+  submitMustFail s.executor do exerciseCmd pending Execute
+
+-- PROVES: the admin cannot change minDelay without going through the delay.
+-- There is no direct "set delay" choice; the only way is ApplyDelayUpdate, so
+-- we test every route to it:
+--   (a) forging a receipt: ExecutedAction needs the executor's signature too;
+--   (b) calling ApplyDelayUpdate with a receipt of a different action type;
+--   (c) re-using a receipt (it is consumed on first use).
+testAdminCannotBypassDelay : Script ()
+testAdminCannotBypassDelay = do
+  s <- setup
+  -- (a) admin alone cannot create the receipt
+  submitMustFail s.admin do
+    createCmd ExecutedAction with
+      admin = s.admin; executor = s.executor
+      guardians = [s.guardian]; watchers = [s.watcher]
+      action = UpdateDelay (seconds 1); executedAt = t0; timelockCid = s.timelockCid
+  -- (b) a genuine receipt for a different action cannot change the delay
+  p1 <- scheduleOk s (UpdateParameter { name = "x", value = 1 })
+  passTime (days 4)
+  r1 <- submit s.executor do exerciseCmd p1 Execute
+  submitMustFail s.admin do exerciseCmd s.timelockCid ApplyDelayUpdate with receiptCid = r1
+  -- (c) a legit UpdateDelay goes through the delay and takes effect
+  p2 <- submit s.admin do
+    exerciseCmd s.timelockCid Schedule with
+      action = UpdateDelay (days 1); eta = time (date 2026 Jan 10) 0 0 0
+  passTime (days 10)
+  submit s.executor do exerciseCmd p2 Execute
+  [(newTl, tl)] <- query @Timelock s.admin
+  assertMsg "delay changed to 1 day" (tl.minDelay == days 1)
+  -- (d) replay: the UpdateDelay receipt is bound to the OLD timelock contract id,
+  -- which was archived when the delay changed, so it cannot be applied again.
+  receipts <- query @ExecutedAction s.admin
+  let [(r2, _)] = filter (\(_, r) -> r.action == UpdateDelay (days 1)) receipts
+  submitMustFail s.admin do exerciseCmd newTl ApplyDelayUpdate with receiptCid = r2
+  submitMustFail s.admin do exerciseCmd s.timelockCid ApplyDelayUpdate with receiptCid = r2
+
+-- PROVES: a zero/negative delay is rejected at creation (ensure clause).
+testZeroDelayRejected : Script ()
+testZeroDelayRejected = do
+  s <- setup
+  submitMustFail s.admin do
+    createCmd Timelock with
+      admin = s.admin; executor = s.executor; guardians = []; watchers = []
+      minDelay = seconds 0
+
+-- PROVES (privacy): each party only sees what it is a stakeholder of.
+-- Admin, executor, guardians, watcher see the pending action; outsider sees nothing.
+testPrivacy : Script ()
+testPrivacy = do
+  s <- setup
+  pending <- scheduleOk s (TransferTreasury { recipient = s.watcher, amount = 100.0 })
+  forA_ [s.admin, s.executor, s.guardian, s.guardian2, s.watcher] \p -> do
+    visible <- queryContractId p pending
+    assertMsg "stakeholder must see the pending action" (visible /= None)
+  seen <- query @PendingAction s.outsider
+  assertMsg "outsider's active-contract query is empty" (null seen)
+  byId <- queryContractId s.outsider pending
+  assertMsg "outsider cannot fetch it by id either" (byId == None)
+  tls <- query @Timelock s.outsider
+  assertMsg "outsider cannot see the timelock config" (null tls)
