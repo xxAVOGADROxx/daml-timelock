@@ -1,0 +1,149 @@
+-- | A Timelock for Canton, modeled on OpenZeppelin's EVM `TimelockController`.
+--
+-- Daml primer (for readers coming from EVM / Cardano):
+--   * A @template@ is a contract type. Each contract instance has a
+--     "contract id" (ContractId) and is immutable; "changing" it means
+--     archiving it and creating a new one.
+--   * @signatory@: parties whose authorization is REQUIRED to create the
+--     contract. They also always see it, and are bound by it.
+--   * @observer@: parties that can SEE the contract but did not authorize it.
+--     Daml has no global state: a party only ever receives the contracts it is
+--     a stakeholder (signatory or observer) of. This is the privacy model.
+--   * @choice@: an action a party can take on a contract. The @controller@ is
+--     the party (or parties) allowed to exercise it. A normal ("consuming")
+--     choice archives the contract, so it can run at most once.
+--   * Inside a choice body the authority is: the controller + the contract's
+--     signatories. That is how a choice can create contracts that need
+--     signatures from parties who are not the one submitting the transaction.
+--   * No contract keys: they are unsupported on Canton 3, so we pass
+--     ContractIds around explicitly.
+module Timelock where
+
+import DA.Time (RelTime, addRelTime, seconds)
+
+-- | Example actions the timelock can delay. This is a plain data type (a sum
+-- type, like a Haskell ADT), not a template: it has no parties or lifecycle.
+data TimelockedAction
+  = UpdateParameter with name : Text; value : Int
+    -- ^ Record a parameter change in some governed system.
+  | UpdateDelay RelTime
+    -- ^ Change the timelock's own @minDelay@. Must itself be delayed.
+  | TransferTreasury with recipient : Party; amount : Decimal
+    -- ^ Record a treasury transfer to a party. (@Decimal@ is @Numeric 10@.)
+  deriving (Eq, Show)
+
+-- | The configuration contract. Its observers can see the timelock settings.
+template Timelock
+  with
+    admin : Party        -- ^ proposer: may schedule actions
+    executor : Party     -- ^ may execute actions once they are ready
+    guardians : [Party]  -- ^ any one of them may cancel a pending action
+    watchers : [Party]   -- ^ read-only observers of every pending action
+    minDelay : RelTime   -- ^ minimum wait between scheduling and execution
+  where
+    signatory admin
+    observer executor, guardians, watchers
+
+    -- Invariant checked at every creation: a zero or negative delay would
+    -- make the timelock pointless.
+    ensure minDelay > seconds 0
+
+    -- | Schedule an action. @nonconsuming@: the Timelock stays active, so it
+    -- can schedule many actions (a default consuming choice would archive it).
+    nonconsuming choice Schedule : ContractId PendingAction
+      with
+        action : TimelockedAction
+        eta : Time  -- ^ requested earliest execution time
+      controller admin
+      do
+        now <- getTime  -- ledger time of this transaction
+        assertMsg "eta must be at least now + minDelay"
+          (eta >= addRelTime now minDelay)
+        create PendingAction with
+          admin; executor; guardians; watchers
+          action; eta; timelockCid = self
+
+    -- | Apply a delay change. DESIGN DECISION: there is deliberately no
+    -- direct "admin sets minDelay" choice, because the admin could then
+    -- bypass the delay (set it to 1 microsecond, then schedule anything).
+    -- Instead this choice requires an 'ExecutedAction' receipt proving that an
+    -- @UpdateDelay@ action went through the full schedule -> wait -> execute
+    -- path. The receipt needs the signatures of BOTH admin and executor, so
+    -- the admin alone cannot forge one. Replay is impossible too: the receipt is bound to this exact Timelock contract id, and applying it archives this Timelock, so the receipt can never match a later Timelock.
+    choice ApplyDelayUpdate : ContractId Timelock
+      with
+        receiptCid : ContractId ExecutedAction
+      controller admin
+      do
+        receipt <- fetch receiptCid
+        assertMsg "receipt is for a different timelock" (receipt.timelockCid == self)
+        case receipt.action of
+          UpdateDelay newDelay -> do
+            -- Creating the new Timelock re-checks the `ensure minDelay > 0`.
+            create this with minDelay = newDelay
+          _ -> abort "receipt is not an UpdateDelay action"
+
+-- | A scheduled action waiting for its @eta@. Visible ONLY to its stakeholders.
+template PendingAction
+  with
+    admin : Party
+    executor : Party
+    guardians : [Party]
+    watchers : [Party]
+    action : TimelockedAction
+    eta : Time
+    timelockCid : ContractId Timelock
+  where
+    signatory admin
+    -- Privacy-critical: these are the only parties (besides admin) that will
+    -- ever learn this contract exists. Anyone else gets nothing.
+    observer executor, guardians, watchers
+
+    -- | Run the action once ledger time has reached @eta@. Consuming: the
+    -- pending action is archived, so a second execution is impossible.
+    choice Execute : ContractId ExecutedAction
+      controller executor
+      do
+        now <- getTime
+        assertMsg "action is not ready yet (now < eta)" (now >= eta)
+        -- Authority here = executor + admin (signatory of this contract), so
+        -- we can create a receipt that both of them "sign".
+        receiptCid <- create ExecutedAction with
+          admin; executor; guardians; watchers
+          action; executedAt = now; timelockCid
+        case action of
+          -- The only action with a real effect: update the timelock itself.
+          -- NOTE: this needs the timelock contract referenced at scheduling
+          -- time to still be active (see README, limitations).
+          UpdateDelay _ -> do
+            _ <- exercise timelockCid ApplyDelayUpdate with receiptCid
+            pure ()
+          -- Other actions are only recorded as evidence in this demo.
+          _ -> pure ()
+        pure receiptCid
+
+    -- | Cancel before execution. @canceller@ is a choice argument ("flexible
+    -- controller"): any party may try, but the body only lets guardians pass.
+    -- Without the check any party that can see the contract could cancel it.
+    choice Cancel : ()
+      with
+        canceller : Party
+      controller canceller
+      do
+        assertMsg "only a guardian can cancel" (canceller `elem` guardians)
+        pure ()
+
+-- | Evidence that an action was executed. Signed by admin AND executor so it
+-- cannot be created by the admin alone (this is what protects 'ApplyDelayUpdate').
+template ExecutedAction
+  with
+    admin : Party
+    executor : Party
+    guardians : [Party]
+    watchers : [Party]
+    action : TimelockedAction
+    executedAt : Time
+    timelockCid : ContractId Timelock
+  where
+    signatory admin, executor
+    observer guardians, watchers
